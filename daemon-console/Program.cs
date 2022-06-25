@@ -1,6 +1,8 @@
 ﻿// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+using Google.Apis.Auth.OAuth2;
+using Google.Cloud.Storage.V1;
 using Microsoft.Graph;
 using Microsoft.Identity.Client;
 using Microsoft.Identity.Web;
@@ -40,68 +42,54 @@ namespace daemon_console
             Console.ReadKey();
         }
 
-        private static async Task<string> GetTokenForUserAsync(AuthenticationConfig config)
-        {
-            AuthenticationResult result = null;
-            IPublicClientApplication app;
-
-            // PublicClientApplicationを生成（MSALの初期化）
-            app = PublicClientApplicationBuilder.Create(config.ClientId)
-                   .WithAuthority(new Uri(config.Authority))
-                   .WithRedirectUri("http://localhost")
-                   .Build();
-
-            IEnumerable<IAccount> accounts = await app.GetAccountsAsync().ConfigureAwait(false);
-            IAccount firstAccount = accounts.FirstOrDefault();
-
-            // With client credentials flows the scopes is ALWAYS of the shape "resource/.default", as the 
-            // application permissions need to be set statically (in the portal or by PowerShell), and then granted by
-            // a tenant administrator. 
-            string[] scopes = new string[] { "user.read" };
-
-
-            //まずは自動でサインインできるか試す
-            try
-            {
-                result = await app.AcquireTokenSilent(scopes, firstAccount)
-                                                    .ExecuteAsync();
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("Token acquired \n");
-                Console.ResetColor();
-            }
-            //自動でサインインできなければ、対話ウインドウでサインインする
-            catch (MsalUiRequiredException)
-            {
-                result = await app.AcquireTokenInteractive(scopes)
-                                                    .WithUseEmbeddedWebView(false)
-                                                    .ExecuteAsync()
-                                                    .ConfigureAwait(false);
-            }
-            return result.AccessToken;
-        }
 
         private static async Task RunAsync()
         {
             AuthenticationConfig config = AuthenticationConfig.ReadFromJsonFile("appsettings.json");
 
+            Console.WriteLine("Google Cloud - Authenticating as a service account.");
 
+            // calling this directly just for clarity, this should be a callback
+            var credential = GoogleCredential.FromFile("verdant-tempest-354310-922a6279a7a4.json");
+            var storage = StorageClient.Create(credential);
 
-            //var httpClient = new HttpClient();
-            //var apiCaller = new ProtectedApiCallHelper(httpClient);
-            //await apiCaller.CallWebApiAndProcessResultASync($"{config.ApiUrl}v1.0/users", await GetTokenForUserAsync(config), Display);
+            OidcToken oidcToken = await credential.GetOidcTokenAsync(OidcTokenOptions.FromTargetAudience("api://AzureADTokenExchange").WithTokenFormat(OidcTokenFormat.Standard)).ConfigureAwait(false);
+            string tt = await oidcToken.GetAccessTokenAsync().ConfigureAwait(false);
 
-            //認証済みのGraphServiceClientインスタンスがない場合は、
-            //サインインして新たに生成する
-            if (authenticatedClient == null)
+            Console.WriteLine("Make an authenticated Google Cloud Storage API request.");
+            Console.WriteLine("");
+
+            // Make an authenticated API request.
+            var buckets = storage.ListBuckets("verdant-tempest-354310");
+            foreach (var bucket in buckets)
             {
-                authenticatedClient = new GraphServiceClient(
-                    new DelegateAuthenticationProvider(async (requestMessage) =>
-                    {
-                        requestMessage.Headers.Authorization
-                            = new AuthenticationHeaderValue("bearer", await GetTokenForUserAsync(config));
-                    }));
+                Console.WriteLine(bucket.Name);
             }
-            var user = await authenticatedClient.Me.Request().GetAsync();
+            Console.WriteLine("");
+
+            Console.WriteLine("Exchange a Google token for an access token.");
+            Console.WriteLine("");
+
+            // pass token as a client assertion to the confidential client app
+            var app = ConfidentialClientApplicationBuilder.Create(config.ClientId)
+                                            .WithClientAssertion(tt)
+                                            .Build();
+
+            var authResult = app.AcquireTokenForClient(new string[] { ".default" })
+                .WithAuthority(config.Authority)
+                .ExecuteAsync();
+
+            var authenticatedClient = new GraphServiceClient(
+                new DelegateAuthenticationProvider(async (requestMessage) =>
+                {
+                    requestMessage.Headers.Authorization
+                        = new AuthenticationHeaderValue("bearer", authResult.Result.AccessToken);
+                }));
+
+
+            var c = await authenticatedClient.Users.Request().GetAsync();
+            var user = await authenticatedClient.Users["a5a9bf6a-4661-43df-b2f3-b0f727c36be6"].Request().GetAsync();
+
             Console.WriteLine($"displayName: {user.DisplayName}");
             Console.WriteLine($"givenName: {user.GivenName}");
             Console.WriteLine($"jobTitle: {user.JobTitle}");
@@ -112,55 +100,6 @@ namespace daemon_console
             Console.WriteLine($"surname: {user.Surname}");
             Console.WriteLine($"userPrincipalName: {user.UserPrincipalName}");
 
-        }
-
-        /// <summary>
-        /// Display the result of the Web API call
-        /// </summary>
-        /// <param name="result">Object to display</param>
-        private static void Display(JObject result)
-        {
-            foreach (JProperty child in result.Properties().Where(p => !p.Name.StartsWith("@")))
-            {
-                Console.WriteLine($"{child.Name} = {child.Value}");
-            }
-        }
-
-        /// <summary>
-        /// Checks if the sample is configured for using ClientSecret or Certificate. This method is just for the sake of this sample.
-        /// You won't need this verification in your production application since you will be authenticating in AAD using one mechanism only.
-        /// </summary>
-        /// <param name="config">Configuration from appsettings.json</param>
-        /// <returns></returns>
-        private static bool AppUsesClientSecret(AuthenticationConfig config)
-        {
-            string clientSecretPlaceholderValue = "[Enter here a client secret for your application]";
-            string certificatePlaceholderValue = "[Or instead of client secret: Enter here the name of a certificate (from the user cert store) as registered with your application]";
-
-            if (!String.IsNullOrWhiteSpace(config.ClientSecret) && config.ClientSecret != clientSecretPlaceholderValue)
-            {
-                return true;
-            }
-
-            else if (!String.IsNullOrWhiteSpace(config.CertificateName) && config.CertificateName != certificatePlaceholderValue)
-            {
-                return false;
-            }
-
-            else
-                throw new Exception("You must choose between using client secret or certificate. Please update appsettings.json file.");
-        }
-
-        private static X509Certificate2 ReadCertificate(string certificateName)
-        {
-            if (string.IsNullOrWhiteSpace(certificateName))
-            {
-                throw new ArgumentException("certificateName should not be empty. Please set the CertificateName setting in the appsettings.json", "certificateName");
-            }
-            CertificateDescription certificateDescription = CertificateDescription.FromStoreWithDistinguishedName(certificateName);
-            DefaultCertificateLoader defaultCertificateLoader = new DefaultCertificateLoader();
-            defaultCertificateLoader.LoadIfNeeded(certificateDescription);
-            return certificateDescription.Certificate;
         }
     }
 }
